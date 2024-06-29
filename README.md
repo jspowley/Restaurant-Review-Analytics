@@ -1,4 +1,4 @@
-# Restaurant Review Analytics
+# Restaurant Review Analytics in R
 
 A restuarant review analytics workflow which scrapes the data directly from the source site, prepares the review text into an ML ready format, by vectorizing it into 50 dimensions, and then uses the preprocessed information to train a classification ML model.
 
