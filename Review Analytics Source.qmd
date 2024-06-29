@@ -1,0 +1,1936 @@
+---
+title: "Lending a Yelping Hand"
+author: "Justin Powley and Araoluwa Adegbite"
+date: "2024/04/13"
+format: 
+  html:
+    self-contained: true
+editor: visual
+---
+
+```{r, libraries, echo = FALSE, message = FALSE, warning = FALSE}
+library(tidyverse)
+library(RSelenium)
+library(httr)
+library(rvest)
+library(readxl)
+library(tidytext)
+library(wordcloud2)
+library(forcats)
+library(widyr)
+library(word2vec)
+library(tm)
+library(tidymodels)
+library(keras)
+library(brulee)
+library(zoo)
+library(factoextra)
+library(patchwork)
+library(glue)
+library(rlang)
+library(lexicon)
+library(ggfortify)
+library(factoextra)
+library(cluster)
+library(dendextend)
+library(wordcloud2)
+library(kableExtra)
+library(ggwordcloud)
+library(pandoc)
+library(pander)
+
+run_scraping <- TRUE
+```
+
+```{r, scraping_functions, echo = FALSE, message = FALSE, eval = run_scraping}
+# credit to you Phillipe for the idea. Slightly rewordked into a way which makes sense to me.
+scrape.sleep <- function(lowest = 4, highest = 10) {
+  delay <- runif(1, min = lowest, max = highest)
+  Sys.sleep(delay)
+}
+
+short.sleep <- function(){
+  scrape.sleep(0.2,0.8)
+}
+
+tiny.sleep <- function(){
+  scrape.sleep(0.05,0.2)
+}
+```
+
+```{r, init, echo = FALSE, message = FALSE, eval = run_scraping}
+# Manually configuring links comes with the benefit that we can manually check how far to iterate through a sequence of pages without overshooting. That way, any scripts on Yelps end which are specifically on the lookout for that kind of behavior won't see persistent 404 errors, preventing bans. In addition, the large volume of data accessible thorough these pages justifies the extra effort.
+
+# Potential to automate later
+
+# config <- readRDS("project_config.rds")
+
+config <- data.frame(max_iter = c(230,230,230),
+                      location = c("Victoria", "Edmonton", "Toronto"),
+                      link = c("https://www.yelp.com/search?find_desc=Restaurants&find_loc=Victoria%2C+British+Columbia%2C+Canada","https://www.yelp.com/search?find_desc=Restaurants&find_loc=Edmonton%2C+AB%2C+Canada", "https://www.yelp.com/search?find_desc=Restaurants&find_loc=Toronto"))
+```
+
+```{r, firefox_pass1, echo = FALSE, message = FALSE, eval = run_scraping}
+# Load firefox
+rD <- RSelenium::rsDriver(browser = "firefox", chromever = NULL, verbose = FALSE)
+remDr <- rD[["client"]]
+Sys.sleep(2)
+
+# Navigation logic,  pulling DOMs.
+#nrow(config)
+for(i in 1:nrow(config)){
+  remDr$navigate(config$link[i])
+  page_list <- c(remDr$getPageSource())
+    
+  scrape.sleep()
+    
+  j=10
+    
+  while(j<=config$max_iter[i]){
+    
+    link_in <- paste0(config$link[i], "&start=", j)
+    remDr$navigate(link_in)
+    page_in <- remDr$getPageSource()
+    page_list <- append(page_list, page_in)
+
+    scrape.sleep()
+    j <- j + 10
+  }
+  pages <- list(page_list)
+  saveRDS(pages, file = paste0(config$location[i],".rds"))
+}
+
+# Closing Off
+remDr$close()
+rD[["server"]]$stop()
+```
+
+```{r, rest_tiles, echo = FALSE, message = FALSE, eval = run_scraping}
+
+# Strips selected information from a restaurant tile panel, returning a single row data frame.
+
+rest_tile_strip <- function(frame_in, parent){
+  
+  name <- frame_in %>% html_node("a.css-19v1rkv") %>% html_text()
+  url <- frame_in %>% html_node("a.css-19v1rkv") %>% html_attr("href") %>%
+    paste0(parent,.)
+  rating_raw <- frame_in %>% html_node("span.css-gutk1c") %>% html_text()
+  review_count_raw <- frame_in %>% html_node("span.css-chan6m") %>% html_text()
+
+  tags <- frame_in %>% html_nodes("span.css-11bijt4") %>% html_text() %>% toString()
+  
+  data_out <- data.frame(name = name, 
+                         link = url, 
+                         rating = rating_raw, 
+                         review_count = review_count_raw,
+                         tags = tags
+                         )
+  return(data_out)
+}
+```
+
+```{r, loading, echo = FALSE, message = FALSE, eval = run_scraping}
+
+for(i in 1:nrow(config)) {
+  
+  city_pages <- readRDS(file = paste0(config$location[i],".rds"))
+  rest_table <- data.frame(name = NA, link = NA, rating = NA, review_count = NA, tags = NA)
+  
+  for(subpage in city_pages[[1]]){
+    
+    elements <- read_html(subpage) %>%
+    html_nodes(xpath = "//div[contains(@class, 'css-33bb9k') and not(contains(@class, 'ABP'))]")
+  
+    for(elem in elements){
+      df.row <- elem %>% rest_tile_strip(parent = "https://www.yelp.com")
+      rest_table <- rest_table %>% rbind(df.row)
+    }
+  }
+  
+  rest_table <- rest_table %>%
+  tail(-1) %>% 
+  dplyr::distinct(link, .keep_all = TRUE) %>%
+  dplyr::mutate(rating = as.numeric(rating),
+                review_count = str_extract(review_count, pattern = "[0-9]+") %>% as.numeric())
+  
+  saveRDS(rest_table, file = paste0(config$location[i],"_preprocessed.rds"))
+}
+```
+
+```{r, rest_page_general, echo = FALSE, message = FALSE, eval = run_scraping}
+rest_page_general <- function(page_in, ref_link){
+  page_in <- page_in[[1]] %>% read_html()
+  
+  hours <- page_in %>% 
+    html_nodes("table.hours-table__09f24__KR8wh.css-n604h6") %>% 
+    html_nodes("tr") %>% 
+    html_text()
+  
+  info_panel <- page_in %>% 
+    html_nodes("div.css-s81j3n")
+  
+  address <- NA
+  address.seg <- info_panel %>% 
+    html_nodes("div.css-djo2w")
+  for(a in address.seg){
+    if(a %>% html_text() %>% str_detect(pattern = "Get Directions")){
+      address <- a %>% html_text()
+    }
+  }
+    
+  poten_sites <- info_panel %>% 
+    html_nodes("a.css-1idmmu3") %>% 
+    html_attr("href")
+  site_out <- NA
+  for(site in poten_sites){
+    if(!str_detect(site, pattern = "/map/")){
+      site_out <- site
+    }
+  }
+  
+  buttons <- page_in %>% 
+    html_nodes("a.css-4v7jbl")
+  menu_link <- NA
+  for(b in buttons){
+    if(b %>% html_text() %>% str_detect(pattern = "Website menu")){
+      menu_link <- b %>% html_attr("href")
+    }
+  }
+  
+  sections <- page_in %>% html_nodes("section.css-ufd2i")
+  highlights_out <- c()
+  for(s in sections){
+    if(s %>% html_text() %>% str_detect(pattern = "Highlights from the Business")){
+      highlights <- s %>% html_nodes("p.css-sihfu1")
+      for(h in highlights) {
+        highlights_out <- highlights_out %>% append(h %>% html_text())
+      }
+    }
+  }
+  
+  price_score <- NA
+  price_scores_in <- page_in %>% html_nodes("span.css-14r9eb") %>% html_text()
+  for(e in price_scores_in){
+    if(e %>% str_detect(pattern = "$")){
+      price_score <- e
+    }
+  }
+  
+  photo_count <- page_in %>% html_nodes("a.css-1wpxijb") %>% html_text()
+  
+  attribute_list <- page_in %>% 
+    html_nodes("div.arrange__09f24__LDfbs.gutter-2__09f24__CCmUo.layout-wrap__09f24__GEBlv.layout-2-units__09f24__PsGVW.css-1qn0b6x") %>% 
+    html_nodes("div.arrange-unit__09f24__rqHTg.arrange-unit-fill__09f24__CUubG.css-1qn0b6x")
+  attributes_out <- attribute_list %>% html_text()
+  
+  health_score_link <- NA
+  for (a in attribute_list){
+    if(a %>% html_text() %>% str_detect(pattern = "Health Score")){
+      health_score_link <- a %>% 
+        html_nodes("a.css-1idmmu3") %>% 
+        html_attr("href")
+    }
+  }
+  
+  popular_items <- NA
+  popular_items <- page_in %>% 
+    html_nodes(xpath = "//div[contains(@data-testid, 'scroll-container') and contains(@class, 'css-wtz7x')]") %>%
+    html_nodes("img") %>% 
+    html_attr("alt")
+  
+#  print(hours)
+#  print(address)
+#  print(site_out)
+#  print(menu_link)
+#  print(highlights_out)
+#  print(price_score)
+#  print(photo_count)
+#  print(attributes_out)
+#  print(health_score_link)
+  
+#  out_temp <- list(hours = list(hours),
+              #address = address,
+              #restuarant_site = site_out,
+              #menu_link = menu_link,
+              #business_highlights = list(highlights_out),
+              #price_score = price_score,
+              #photo_count = photo_count,
+              #attributes = list(attributes_out),
+              #health_link = health_score_link)
+  
+  out <- data.frame(
+              link = ref_link,
+              address = address,
+              restuarant_site = site_out,
+              menu_link = menu_link,
+              price_score = price_score,
+              photo_count = photo_count,
+              health_link = health_score_link,
+              
+              hours = I(list(hours)),
+              business_highlights = I(list(highlights_out)),
+              attributes = I(list(attributes_out)),
+              popular_items = I(list(popular_items))
+              )
+  return(out)
+}
+```
+
+```{r, stripping_rest_page, echo = FALSE, message = FALSE, eval = run_scraping, error = FALSE}
+
+for(index in 1:nrow(config)){
+city_df <- readRDS(file = paste0(config$location[index],"_preprocessed.rds"))
+
+rD <- RSelenium::rsDriver(browser = "firefox", chromever = NULL, verbose = FALSE)
+remDr <- rD[["client"]]
+Sys.sleep(2)
+
+for(i in 1:nrow(city_df)){
+  
+  remDr$navigate(city_df$link[i])
+  scrape.sleep()
+  
+  button <- tryCatch(
+    remDr$findElement(using = "css", value = "button.css-r3lhny[aria-controls='expander-link-content-:Rjlecr:']"),
+    error = function(e) NULL
+  )
+  tiny.sleep()
+  
+  if(!is.null(button)){
+    button$clickElement()
+  }
+  
+  tiny.sleep()
+
+  page <- remDr$getPageSource()
+  
+  # Feature Extraction
+  general <- rest_page_general(page, city_df$link[i])
+  if(i == 1){
+    general_out <- general
+  }else{
+    general_out <- general_out %>% add_row(general)
+  }
+}
+
+remDr$close()
+rD[["server"]]$stop()
+saveRDS(general_out, file = paste0(config$location[index],"_Rest_General.rds"))
+}
+```
+
+```{r, review_function, echo = FALSE, message = FALSE, eval = run_scraping}
+get_passport_stat <- function(review_in, aria_label){
+  
+  out <- NA
+  
+  p_items <- review_in %>% html_nodes("div.user-passport-stats__09f24__NQxB4.css-1qn0b6x") %>% html_nodes("div.css-volmcs")
+  
+  for(p in p_items){
+    if(p %>% html_attr("aria-label") == aria_label){
+      out <- p %>% html_text()
+    }
+  }
+  
+  return(out)
+}
+
+
+
+strip_reviews <- function(page, ref_link){
+  
+  reviews <- page[[1]] %>% read_html() %>% html_nodes(xpath = "//ul[contains(@class,'list__09f24__ynIEd')][li[div]]") %>% 
+    html_nodes("li")
+  
+  reviews %>% length()
+  review_out <- data.frame(text = NA, follow_up = NA, stars = NA, prior_stars = NA, prior_review_text = NA, prior_review_date = NA, review_date = NA, writer_origin = NA, images_posted = NA, user_id = NA, user_friends = NA, user_reviews = NA, user_photos = NA)
+  i <- 1
+  for(r in reviews){
+    # print(r %>% html_text())
+    # print(paste0("Count is ",i))
+    # i <- i + 1
+    
+    review_out <- review_out %>% 
+      add_row(text = r %>% html_node("p.comment__09f24__D0cxf.css-qgunke") %>% html_text(),
+              
+              follow_up = case_when(r %>% html_nodes("p.comment__09f24__D0cxf.css-qgunke") %>% length > 1 ~ TRUE, TRUE ~ FALSE),
+              
+              stars = r %>% html_node("span.css-1d8srnw") %>% html_node("div.css-14g69b3") %>% html_attr("aria-label"),
+              
+              review_date = r %>% html_node("div.css-10n911v") %>%
+                html_node("div.arrange-unit__09f24__rqHTg.arrange-unit-fill__09f24__CUubG.css-1qn0b6x") %>% 
+                html_node("span.css-chan6m") %>% html_text(),
+              
+              prior_review_date = case_when(follow_up ~ r %>% html_node("div.block-quote__09f24__qASfJ.css-kjl932") %>%
+                                              html_node("div.arrange-unit__09f24__rqHTg.arrange-unit-fill__09f24__CUubG.css-1qn0b6x") %>%
+                                              html_node("span.css-chan6m") %>% html_text(), TRUE ~ NA),
+              
+              prior_review_text = case_when(follow_up ~ r %>% html_node("div.block-quote__09f24__qASfJ.css-kjl932") %>% 
+                                              html_node("span.raw__09f24__T4Ezm") %>% html_text(), TRUE ~ NA),
+              
+              prior_stars = case_when(follow_up ~ r %>% html_node("div.block-quote__09f24__qASfJ.css-kjl932") %>% 
+                                        html_node("span.css-1d8srnw") %>% html_node("div.css-14g69b3") %>% html_attr("aria-label"), 
+                                      TRUE ~ NA),
+              writer_origin = r %>% html_node("span.css-qgunke") %>% html_text(),
+              images_posted = r %>% html_nodes("img.css-xlzvdl") %>% length(),
+              user_id = r %>% html_node("a.css-19v1rkv") %>% html_attr("href"),
+              user_friends = r %>% get_passport_stat("Friends"),
+              user_reviews = r %>% get_passport_stat("Reviews"),
+              user_photos = r %>% get_passport_stat("Photos"))
+  }
+  review_out <- review_out %>% tail(-1)
+  return(review_out)
+}
+```
+
+```{r, test_page, echo = FALSE, message = FALSE, eval = run_scraping}
+rD <- RSelenium::rsDriver(browser = "firefox", chromever = NULL, verbose = FALSE)
+remDr <- rD[["client"]]
+
+remDr$navigate("https://www.yelp.com/biz/blowers-and-grafton-edmonton-2?osq=Restaurants")
+scrape.sleep()
+page <- remDr$getPageSource()
+
+remDr$close()
+rD[["server"]]$stop()
+
+
+#rating test
+li_nodes <- page[[1]] %>% read_html() %>% html_nodes(xpath = "//ul[contains(@class,'list__09f24__ynIEd')][li[div]]") %>% 
+  html_nodes("li")
+
+li_nodes[10] %>% get_passport_stat("Photos")
+li_nodes[10] %>% html_nodes("div.user-passport-stats__09f24__NQxB4.css-1qn0b6x") %>% html_nodes("div.css-volmcs")
+```
+
+```{r, review_extraction, echo = FALSE, message = FALSE, eval = run_scraping}
+for(index in 1:nrow(config)){
+city_df <- readRDS(file = paste0(config$location[index],"_preprocessed.rds")) %>% 
+                     dplyr::mutate(review_count = case_when(is.na(review_count) ~ 0,
+                                                            TRUE ~ review_count))
+
+rD <- RSelenium::rsDriver(browser = "firefox", chromever = NULL, verbose = FALSE)
+remDr <- rD[["client"]]
+Sys.sleep(2)
+
+for(i in 1:nrow(city_df)){
+  
+  if(i == 1){
+    city_reviews_out <- data.frame(ref_link = NA, review_df = NA)
+  }
+  max_iter <- floor(city_df$review_count[i]/10)
+  if(floor(city_df$review_count[i]/10) == city_df$review_count[i]/10){
+    max_iter <- max_iter - 1
+  }
+  
+  root_link <- city_df$link[i]
+  
+  for(j in 0:max_iter){
+    if(j == 0){
+      remDr$navigate(root_link)
+      scrape.sleep()
+      page <- remDr$getPageSource()
+      reviews_out <- strip_reviews(page)
+    } else {
+      remDr$navigate(paste0(root_link,"&start=",j*10))
+      scrape.sleep()
+      page <- remDr$getPageSource()
+      reviews_out <- rbind(reviews_out, strip_reviews(page))
+    }
+  }
+  
+  city_reviews_out <- city_reviews_out %>% add_row(ref_link = city_df$link[i], review_df = nest(reviews_out))
+  saveRDS(city_reviews_out, file = paste0(config$location[index],"_reviews.rds"))
+}
+remDr$close()
+rD[["server"]]$stop()
+}
+```
+
+```{r, merge_layers, echo = FALSE, message = FALSE, eval = run_scraping}
+for(loc in config$location){
+  rev <- readRDS(paste0(loc,"_reviews.rds")) %>% dplyr::rename(link = ref_link)
+  gen <- readRDS(paste0(loc,"_Rest_General.rds"))
+  master <- readRDS(paste0(loc,"_preprocessed.rds"))
+
+  master %>% left_join(gen, by = "link") %>% left_join(rev, by = "link") %>% 
+    saveRDS(file = paste0(loc,"_master.rds"))
+}
+
+for(i in 1:nrow(config)){
+  df_in <- readRDS(paste0(config$location[i],"_master.rds")) %>% 
+    dplyr::mutate(location = config$location[i])
+  if(i == 1){
+    master_df <- df_in
+  } else {
+    master_df <- master_df %>% rbind(df_in)
+  }
+}
+
+master_df %>% unnest(review_df) %>% unnest(data) %>% saveRDS(file = "master_df.rds")
+```
+
+# Summary of Results
+
+The goal of this project is to predict Yelp review scores between one to five stars based on the text contained in each review. By developing a model that predicts review stars based on the text in a review, reviews which surprise the model, due to containing more complex information, can readily be identified. To accomplish this, we scraped 47000+ reviews from Yelp for top restaurants in three Canadian cities. Our final model uses a classification machine learning model trained with the Brulee MLP engine to predict review scores and successfully predicts a review star rating approximately 59% of the time. We found 5-star reviews which were mis-classified by our model typically contain complaints or pain points from customers that they felt didn't warrant providing a lower than 5-star rating. Because of this, management can find negative critical feedback in 5-star reviews that would otherwise be lost if filtering data to 4-star reviews or lower.
+
+Our final model workflow works in 3 major steps. First, data is cleaned into a vectorizable format. This involves cleaning common errors, adding valence shifter tagging to certain phrases, and removing remaining stop words. Secondly, our words are run through the Word2Vec package into 50-dimensional space. Finally, for each review, the word vectors for all words in the review are added together, before being fed to the model training and testing workflow. This paper will explore some steps taken in reaching this final method, as well as some of our key findings from exploring which resulted from our exploration.
+
+# Introduction
+
+After processing 47000+ reviews and approaching our data from multiple angles, one of the hardest parts of this project was trying to explain exactly what it was we were doing and why we were doing it. We first wanted to solve a problem in the restaurant business by identifying consumer patterns. This required sourcing adequate information so we could learn more about the industry, so that our solutions would be meaningfully connected to the market we wanted to improve. We chose Yelp.ca due to the high volume of consumer information on the prospect of pulling consumer insights.
+
+With forty-seven thousand individual reviews from Yelp to interpret, each containing a uniquely written excerpt about the individual's experience and their thoughts, we realized very quickly we had a problem. Some reviews were very generic and non-informative. Examples include, "The food was great and I had a good time", or "I really liked the place". Reviews like this contain very little contextual information which doesn't provide much more insights beyond simply looking at the star rating given, and doesn't provide any unique information which broadens the picture. Other reviews offered complex stories about someone's experience. Each review varied in word choice, token length, and subject focus. We realized narrowing the problem scope would be crucial if we were to succeed in disseminating complex and unstructured data points from each other.
+
+Another realization that helped us frame the problem was that in a theoretical case, two reviews could contain the exact same text. They are written the same way, word for word, and thus convey the same meaning. The difference is, that one review was written by one person, and one review was written by another, and as a result, each review is given *different* stars even though they contain the exact *same* text. These previously discussed difficulties provide the pretext for our solution. If we could build a model that predicts a star rating based on text content, it would accomplish two things for us. It can help us normalize review scores to the reference point of an impartial reader (as opposed to the wide variety of scores different writers provide for what they write), and it can also help us identify the reviews that contain more interesting and useful information, such as when someone complains about some aspect of the restaurant but gives it 5 stars anyways. Our goal is to predict a reviews star score entirely from its text content, with these end use cases in mind.
+
+## Scraping
+
+Talking about scraping is more of a house cleaning item. For those wishing to try the web scraping features embedded in this document, the information below is important for understanding the scraping workflow. If only concerned with the resulting analysis, feel free to skip to the TLDR below.
+
+Due to the high time requirements of scraping, an .rds file is saved at each stage of the process, per city. This mitigates the damage of potential connection interrupts or time outs, with the consequence of cluttering the local directory. Because of this, it is highly recommended this document is run from its own directory if exploring the web scraping functionality. Finally, fully processed data is merged and cached as **master_df.rds**, allowing the report to be run from a fixed point. With that in mind, web scraping can be enabled by setting **run_scraping** to TRUE. A single city takes approximately 5-6 hours to scrape, and a VPN is required to complete it successfully. Query rates are throttled to 6-10 seconds between queries to prevent spamming web requests.
+
+To scrape Yelp, three iterative processes are required. Firstly, we access all listed restaurants for a particular city query, up to a maximum of 240. From here, we visit each restaurant page to pull general information such as attributes, hours, address, and the restaurant's website. Finally, we visit every review page under the restaurant page, to gather all reviews. This provides us with a very wide variety of information on each restaurant and each review. We catalog each reviewer's personal page html link, allowing us to keep track of reviewer histories without recording personal information. We collect information on popular menu items, pictures posted, and most importantly, the review text and review stars. We took the approach of getting more than we thought we needed on the first pass, to allow greater ease of pivoting to new problems later if required. The raw web-scraped data is stored in the **data** data frame.
+
+**TLDR;** Web scraping occurs in three layers. Find restaurants by city, find features by restaurant, and find reviews by restaurant. Due to how long it takes to web scrape a whole city successfully, multiple cache files were used to save progress at different steps in the process.
+
+## Exploratory Data Analysis
+
+```{r,EDA1, echo = FALSE}
+# Loading Cached Data
+
+data <- readRDS("master_df.rds") %>% 
+  dplyr::mutate(photo_count = photo_count %>% 
+                  str_replace(pattern = "See all ", replacement = "") %>% 
+                  str_replace(pattern = " photos", replacement = ""),
+                stars = stars %>% str_replace(pattern = " star rating", replacement = "") %>% as.numeric()) %>% 
+  dplyr::group_by(link) %>% dplyr::mutate(rating = mean(stars)) %>% 
+  dplyr::ungroup()
+
+```
+
+With `r data %>% nrow()` individual reviews, exploring our data and understanding it more is critical in helping us build a successful predictive model. We want to build a deeper understanding of what makes a review rated high or low. Let's first take a look at restaurant review scores on average.
+
+### Review Stars
+
+```{r, eval = FALSE, echo = FALSE}
+data %>% 
+  dplyr::group_by(tags) %>% 
+  dplyr::mutate(n = n()) %>% 
+  dplyr::ungroup() %>% 
+  dplyr::mutate(tags = forcats::fct_infreq(tags)) %>% 
+  group_by(tags) %>% 
+  dplyr::summarise(n = max(n),
+                   .groups = "keep") %>% 
+  head(30) %>% 
+  ggplot() +
+  geom_col(aes(x = tags, y = n)) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.75)) +
+  labs(x = "", y = "Count", title = "Number of reviews by resturant type", subtitle = "Do we have enough reviews to analyze each restuarant type independently?")
+
+```
+
+```{r, eval = FALSE, echo = FALSE}
+replace_list <- function(str, list_in, repl_list){
+  for(i in 1:length(list_in)){
+    str <- str %>% tolower() %>% str_replace(pattern = list_in[i], replacement = repl_list[i])
+  }
+  return(str)
+}
+
+data %>% 
+  dplyr::select(link, name, tags) %>% 
+  distinct() %>% 
+  dplyr::mutate(tags = tags %>% replace_list(list_in = c("wine bars", "breakfast & brunch", "cocktail bars", "small plates", "dim sum"), repl_list = c("winebars","breakfastbrunch", "cocktails", "smallplates", "dimsum"))) %>% 
+  unnest_tokens(output = keyword, input = tags) %>% 
+  dplyr::mutate(keyword = forcats::fct_infreq(keyword)) %>% 
+  group_by(keyword) %>% 
+  summarise(n = n(),
+            .groups = "keep") %>% 
+  arrange(desc(n)) %>% 
+  head(20) %>% 
+  dplyr::filter(!keyword %in% c("new", "food")) %>% 
+  
+  ggplot()+
+  geom_col(aes(x = keyword, y = n)) +
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.75)) +
+  labs(title = "Restuarants with matching tag:")
+  
+```
+
+```{r, warning = FALSE, echo = FALSE}
+data %>% 
+  group_by(link) %>% 
+  dplyr::select(link, rating) %>% 
+  distinct() %>% 
+  ggplot() +
+  geom_histogram(aes(x = rating, y = ..count../sum(..count..)), bins = 50) +
+  labs(y = "Density", x = "Average Rating", title = "Average Review Distribution")
+```
+
+We can see that most restaurants have a 4-star rating or above on average, with ratings less than 3 stars being exceedingly rare. We expect 5 star reviews to have the highest frequency of occurrences overall. This graph also gives some evidence of survivorship bias. The reason there are less lower star rated restaurants may be that they fail due to lower popularity, causing them to be de-listed and removed from the data pool. There’s also a tendency for people to want to feel good about the money they’ve spent, requiring more pain points overall for them to admit their experience wasn’t satisfactory. Let's take a look at individual review score frequency next:
+
+```{r, warning=FALSE, echo = FALSE}
+data %>% ggplot()+
+  geom_histogram(aes(x = stars, y = ..count../sum(..count..)), bins = 5)+
+  labs(title = "Review Stars Distribution", y = "Density", x = "Stars")
+
+#data %>% group_by(stars) %>% 
+#  dplyr::summarise(n = n(), 
+#                   average_photos = mean(images_posted),
+#                  .groups = "keep")
+```
+
+This graph is deceptively simple but is an important consideration for building a predictive model. What we want to do is make a model that can dynamically predict a review score based on its text content. One key feature is that 5-star reviews occur just over half of the time. This is important to consider since a naive approach that predicts a 5-star review every time will be right just over half of the time. We want our model to be able to divert its decision away from a 5-star prediction intelligently, if enough information is present to justify the diversion. For our model to be successful, we need it to predict 1-4 star reviews **correctly**, more often than it classifies 5-star reviews **incorrectly**. If it can do this, its accuracy will exceed 50%.
+
+```{r, eval = FALSE, echo = FALSE}
+attr <- data$attributes %>% 
+  unlist() %>% 
+  str_split(pattern = ", ") %>% 
+  unlist()
+index_rem <- attr %>% grep(pattern = c("Health"))
+
+attr[-index_rem] %>% 
+  unique()
+```
+
+```{r, EDA2, eval = FALSE, echo = FALSE}
+#data_tokenized <- data %>%
+#  dplyr::select(text, stars) %>% 
+#  tidytext::unnest_tokens(output = word, input = text, token = "ngrams", n = 3) %>% 
+#  group_by(word) %>% 
+#  dplyr::summarise(mean = mean(stars), 
+#                   n = n(),
+#                   .groups = "keep") %>% 
+#  arrange(desc(mean))
+
+#temp <- data_tokenized %>% dplyr::filter(n>10)
+
+user_multi_reviews <- data %>% group_by(user_id) %>% 
+  summarise(n = n(), .groups = "keep") %>% 
+  arrange(desc(n))
+user_multi_reviews %>% ggplot(aes(x=n))+
+  geom_histogram(aes(y = after_stat(count)/sum(after_stat(count))), bins = 50) +
+  labs(y = "Density", x = "Number of Reviews, Single User", title = "How many people reviewed more than one restaurant in our set?")
+sum_multi_review <- user_multi_reviews %>%
+  dplyr::ungroup() %>% 
+  dplyr::mutate(two_to_three = case_when(n>1 & n<4 ~ TRUE,
+                                         TRUE ~ FALSE),
+                four_to_ten = case_when(n>3 & n<11 ~ TRUE,
+                                         TRUE ~ FALSE),
+                above_ten = case_when(n>10 ~ TRUE,
+                                         TRUE ~ FALSE),
+                single_review = case_when(n == 1 ~ TRUE,
+                                          TRUE ~ FALSE)) %>% 
+  summarise(above_ten = sum(above_ten),
+            four_to_ten = sum(four_to_ten),
+            two_to_three = sum(two_to_three),
+            single_review = sum(single_review))
+sum_multi_review
+```
+
+### Review Text
+
+The next part of our data exploration focuses on analyzing word content. This helps prepare us for converting our unstructured text data into a structured format that can integrate with a predictive model.
+
+#### 1 Star Reviews:
+
+```{r, echo = FALSE}
+
+data %>% 
+  dplyr::filter(stars == 1) %>% 
+  select(text) %>% 
+  tidytext::unnest_tokens(
+    output = word,
+    input = text,
+    token = "ngrams",
+    n = 4
+  ) %>%
+  dplyr::count(word, sort = T) %>% 
+  tidyr::drop_na() %>% 
+  head(80) %>% 
+  ggplot(aes(label = word, size = n)) +
+  geom_text_wordcloud() +
+  theme_minimal()
+
+#Previously word cloud 2. WC2 has an interesting quirk that doesn't allow multiple wordlclouds to be drawn; we opted for ggwordcloud in its place.
+```
+
+#### 5 Star Reviews:
+
+```{r, echo = FALSE}
+data %>% 
+  dplyr::filter(stars == 5) %>% 
+  select(text) %>% 
+  tidytext::unnest_tokens(
+    output = word,
+    input = text,
+    token = "ngrams",
+    n = 4
+  ) %>% 
+  dplyr::count(word, sort = T) %>% 
+  tidyr::drop_na() %>% 
+  head(80) %>% 
+  ggplot(aes(label = word, size = n)) +
+  geom_text_wordcloud() +
+  theme_minimal()
+```
+
+We see some phrases which could prove useful in determining whether a review is 1 star or not. Phrases such as "will not be returning" and "speak to the manager" indicate a strong negative tone which is unlikely to appear in a 5-star review. If we were to map the phrases on a number line, **1-star phrases** like "I would not recommend" should appear on the very left of the line and **5-star phrases** such as "one of the best" should appear on the far right. We will take this idea of putting words on a number line much farther later, but for now, take note of the idea that we can map words or phrases along a line when comparing them to one another. In this case, we might consider what words are associated with when a restaurant is the "best" versus when it is the "worst".
+
+## Natural Language Processing
+
+Now that we know what we are dealing with, it's time to clean up our text to make it more model-ready. We remove common patterns and mistakes from the text. A very common one is for people to miss a space after the period between words. For example: word.word as opposed to the corrected word. word... The space is critical for our parser to recognize two words are present instead of one. We also replace the restaurant name (i.e., Montanas, Joeys) with the compound word "restuarantname". This ensures that when people talk about the name of the restaurant in different places, the model treats it in the same way. Finally, numbers often appear in reviews in a multitude of different and difficult-to-differentiate contexts, such as the time of arrival, the amount of time something took, the size of a drink, the number of items ordered, the year, and a street address. Since we want to treat these in a similar format, even for different numbers, first we replace times with generics such as the word timecode, and the remaining numbers we replace with bins such as "numthousands" and "numhundreds". This allows numbers that are slightly different but used in the same context to be identifiable (i.e. 18.00 and 15.00 as prices under 20 dollars). **To summarize, we replace similar cases with generic "made up" words, so our future processing can treat them all the same.** After accounting for these, we remove stop words, since they carry less semantic meaning overall, and removing them can bring more clarity going into future NLP processing. We can see our token word distribution after processing below:
+
+```{r, warning = FALSE, eval = FALSE, echo = FALSE}
+# Credit for reg-ex to chat GPT for teaching us how to use the capturing group feature. () and \\1,2etc. can be used to take part of the recognized text as part of the replacement.
+
+scrubbed_text <- data %>% dplyr::mutate(
+  name = name %>% str_replace_all(pattern = "[{}]", ""),
+  text = str_replace(text %>% tolower(),
+                                   pattern = name %>% tolower(),
+                                   replacement = "~RestuarantName~") %>% tolower(),
+                       text = text %>% str_replace(pattern = "[0-9][:][0-9][0-9]", replacement = "timecode"),
+                       text = text %>% str_replace(pattern = "[0-9][.][0-9][/][0-9]+", replacement = "decifractionalrating"),
+                       text = text %>% str_replace("[0-9]+[.][0-9]+", replacement = "decimalNumber"),
+                       text = text %>% str_replace(pattern = "[0-9]+[/][0-9]+", replacement = "fractionalrating"),
+                       text = text %>% str_replace(pattern = "[0-9] stars", replacement = "verbalstars"),
+                       text = text %>% str_replace(pattern = "[0-9]+ out of [0-9]+", replacement = "verbalstars"),
+                       text = gsub("(\\w)\\.(\\w)", "\\1. \\2",text))
+
+singles <- scrubbed_text %>% 
+  dplyr::select(text, stars) %>% 
+  unnest_tokens(output=word, input = text) %>% 
+  anti_join(stop_words, by = "word") %>% 
+  group_by(word) %>%
+  dplyr::mutate(average_stars = mean(stars))
+
+singles %>% 
+  group_by(word) %>% 
+  summarise(n = n(), average_stars = mean(stars), .groups = "keep") %>% 
+  arrange(desc(n)) %>% 
+  dplyr::filter(n > 10) %>% 
+  ggplot() +
+  geom_histogram(aes(x = average_stars, y = ..count../sum(..count..))) +
+  labs(title = "Unweighted density of words by average score", subtitle = "Eqaully weighted index", x = "Average Score", y = "Density")
+  
+singles %>% ggplot() +
+  geom_histogram(aes(x = average_stars, y = ..count../sum(..count..)))+
+  labs(x = "Average Stars", y = "Density, by Weight of Word Usage", title = "Review scores tend higher than word scores, per individual review", subtitle = "Match average resturant score, less spread")
+
+singles %>% 
+  group_by(word) %>% 
+  summarise(n = n(), average_stars = mean(stars), .groups = "keep") %>% 
+  arrange(desc(n))
+```
+
+```{r, eval = FALSE, echo = FALSE}
+numeric_context_trigram <- scrubbed_text %>% 
+  dplyr::select(text, stars) %>% 
+  unnest_tokens(output=word, input = text, token = "ngrams", n = 3) %>% 
+  dplyr::filter(word %>% str_detect(pattern = "[0-9]"))
+
+trigram <- scrubbed_text %>% 
+  dplyr::select(text) %>% 
+  unnest_tokens(output=word, input = text, token = "ngrams", n = 3) %>% 
+  tidyr::separate(word, c("col1", "col2", "col3"), sep = " ") %>% 
+  dplyr::filter(!col1 %in% stop_words$word,
+                !col2 %in% stop_words$word,
+                !col3 %in% stop_words$word) %>% 
+  tidyr::unite(word, col1, col2, col3, sep = " ")
+
+duogram <- scrubbed_text %>%
+  dplyr::mutate(temp = 1, review_PK = cumsum(temp)) %>% 
+  dplyr::select(text, stars, link, review_PK) %>%
+  unnest_tokens(output=word, input = text, token = "ngrams", n = 2) %>% 
+  tidyr::separate(word, c("col1", "col2"), sep = " ") %>% 
+  dplyr::filter(!col1 %in% stop_words$word,
+                !col2 %in% stop_words$word) %>% 
+  tidyr::unite(word, col1, col2, sep = " ") %>% 
+  group_by(word) %>% 
+  dplyr::mutate(n = n()) %>% 
+  dplyr::filter(n>4)
+  
+
+trigram_summary <- trigram %>% 
+  group_by(word) %>% 
+  summarise(n = n(), .groups = "keep") %>% 
+  arrange(desc(n))
+
+pairwise <- trigram %>% 
+  group_by(word) %>% 
+  dplyr::mutate(n = n(), sub_group = "All") %>% 
+  dplyr::filter(n>5)
+
+
+pairwise_duo <- duogram %>%
+  head(50000) %>% 
+  widyr::pairwise_cor(item = word, feature = link) %>% 
+  arrange(desc(correlation))
+
+service_classifier <- pairwise_duo %>% 
+  dplyr::filter(str_detect(item1, pattern = "service"))
+
+temp <- data %>% filter(text %>% str_detect(pattern = "friendly service"))
+```
+
+```{r, word2vec, echo = FALSE, error = FALSE, warning = FALSE, message = FALSE}
+token_initial <- data %>%
+  dplyr::mutate(temp = 1, review_pk = cumsum(temp)) %>% 
+  dplyr::select(text, review_pk) %>% 
+  unnest_tokens(output = word, input = text)
+
+graph_token_vol <- token_initial %>% 
+  group_by(review_pk) %>% 
+  summarise(tokens = n(), .groups = "keep") %>% 
+  ggplot() + 
+  geom_histogram(aes(x = tokens, y = ..count../sum(..count..))) +
+  labs(x = "Tokens in Review", y = "Density of Reviews")
+
+graph_token_vol
+
+count_before <- token_initial$word %>% unique() %>% length()
+
+#Debug code for identifying text patterns requiring pre-processing/parsing
+
+#token_initial %>% 
+#  group_by(word) %>% 
+#  summarise(word_occ = n(), .groups = "keep") %>% 
+#  dplyr::filter(word_occ > 4)
+
+data_vec <- data %>% 
+  filter(str_detect(text, pattern = " ")) %>%
+  dplyr::mutate(old_text = text,
+                temp = 1, review_pk = cumsum(temp),
+                name = name %>% str_replace_all(pattern = "[{}]", ""),
+                text = str_replace(text %>% tolower(),
+                                   pattern = name %>% tolower(),
+                                   replacement = "~RestuarantName~") %>% tolower(),
+                text = text %>% str_replace_all(pattern = "[0-9]+[:-][0-9]+[a][m]", replacement = "timecode"),
+                text = text %>% str_replace_all(pattern = "[0-9]+[:-][0-9]+[p][m]", replacement = "timecode"),
+                text = text %>% str_replace_all(pattern = "[0-9]+[a][m]", replacement = "timecode"),
+                text = text %>% str_replace_all(pattern = "[0-9]+[p][m]", replacement = "timecode"),
+                text = text %>% str_replace_all(pattern = "[0-9]+[o][z]", replacement = "drinksize"),
+                text = text %>% str_replace_all(pattern = "[0-9]+[.][0-9]+\\/[0-9]+", replacement = "decifractional"),
+                text = text %>% str_replace_all(pattern = "[0-9]+\\/[0-9]+", replacement = "fractional"),
+                text = text %>% str_replace_all(pattern = "[0-9]+[.][0-9]+", replacement = "decimalnumber"),
+                text = gsub("([A-z]+)\\.([A-z]+)", "\\1. \\2",text),
+                text = gsub("([0-9]+)(mins)", "\\1 min",text),
+                text = gsub("([0-9]+)(min)", "\\1 min",text),
+                text = gsub("([0-9]+)([A-z]+)", "\\1 \\2",text),
+                text = gsub("([0-9]+),([0-9]+)", "\\1\\2",text),
+                text = text %>% str_replace_all(pattern = "[0-9][0-9][0-9][0-9]", replacement = "numthousands"),
+                text = text %>% str_replace_all(pattern = "[0-9][0-9][0-9]", replacement = "numhundreds"),
+                
+                text = text %>% removeWords(stop_words$word))
+
+data_vec_tokenized <- data_vec %>% 
+  dplyr::mutate(temp = 1, review_pk = cumsum(temp)) %>% 
+  dplyr::select(text, review_pk) %>% 
+  unnest_tokens(output = word, input = text) %>% 
+  anti_join(stop_words, by = "word")
+
+count_after <- data_vec_tokenized$word %>% unique() %>% length()
+
+#Debug code for identifying text patterns requiring pre-processing/parsing
+
+#data_vec_tokenized %>% 
+#  group_by(word) %>% 
+#  summarise(word_occ = n(), .groups = "keep") %>% 
+#  dplyr::filter(word_occ > 4) %>% 
+#  anti_join(stop_words, by = "word")
+```
+
+## Word2Vec
+
+Referring back to the idea of putting words on a number line, for whether they are typical of 5-star reviews or 1-star reviews, word2vec uses an unsupervised machine learning process to map words onto 50 different number lines. The idea is that each number line considers a different contextual feature it can map a word on, but the algorithm doesn’t know what that feature specifically is our what it means. For example, a person could map the word “bread” and “apple” on a number line representing sweetness, by placing them on separate sides. Word2vec could accomplish something similar, however it won’t be able to identify what that number line represents. At its heart, word2vec takes adjacent words and tries to predict the next word using the first word. It then evaluates its success and adjusts accordingly. The weights of the different arms of the network, once trained, become the vector coordinates of each word. What we get as a result is all our keywords mapped into 50-dimensional coordinate space.
+
+An essential feature of word2vec vectorization is it allows words to be added or subtracted from one another. A famous example of this is when word2vec vectorizes the vocabulary of Wikipedia, you can take the coordinates for the word king, subtract man, and add woman, and the closest vector coordinate would be the word queen. The idea is that the semantic features are captured in the vector coordinate space.
+
+We run word2vec on our processed data using the skip-gram method as opposed to the continuous bag of words method. The reason for this is the skip-gram method typically performs better when attempting to contextualize a word that only appears once or twice in the entire corpus. It’s able to recognize when the surrounding context is applicable to multiple different words which themselves appear infrequently in contexts that occur often (Van Gils, n.d.).
+
+```{r, echo = FALSE}
+model <- word2vec(data_vec$text, type = "skip-gram")
+word_vectors <- as.matrix(model) %>% as.data.frame() %>% rownames_to_column() %>% dplyr::rename(word = rowname)
+```
+
+```{r, eval = FALSE, echo = FALSE}
+similarity_query <- predict(model, c("delicious", "beer", "slow"), type = "nearest", top_n = 5) %>% print()
+```
+
+We can now choose any word we know is plotted in the vector space and find all words which are closest neighbors to it. As we can see, semantically similar words group together, such as “chicken” and “wings”...
+
+```{r, echo = FALSE}
+preference_categories <- c("service", "wait", "chicken", "accessibility")
+
+for (category in preference_categories) {
+  prediction_result<- predict(model, category, type = "nearest", top_n = 5)
+  df<- as.data.frame(prediction_result)
+  df_name <- paste0(category, "_dictionary")
+  assign(df_name, df)
+}
+
+chicken_dictionary <- chicken_dictionary %>% dplyr::rename(Query = chicken.term1, Match = chicken.term2) %>% dplyr::select(Query, Match)
+
+service_dictionary <- service_dictionary %>% dplyr::rename(Query = service.term1, Match = service.term2) %>% dplyr::select(Query, Match)
+
+rbind(chicken_dictionary, service_dictionary)%>%
+  kableExtra::kable(format = "markdown", size = "small") %>% kable_styling()
+```
+
+This provides us with a framework that is almost ready to be used as a model input. The final step is to add together all the word vectors for each review. This provides a cumulative score of axis features. In some dimensions, words will cancel out against each other, netting towards zero. In other cases, the compounding effect of each word will make certain dimensions of the vector space more pronounced.
+
+```{r, sum_all_review_text_vectors, echo = FALSE}
+
+# This code takes all filtered words for a review, and adds their word2vec vectors together. We then do this for every review.
+
+sum_vector <- function(text_in, dict){
+reference_vec <- text_in %>% 
+  str_split(pattern = " ") %>% 
+  as.data.frame() %>% setNames("word") %>%  
+  left_join(dict, by = "word") %>% 
+  drop_na() %>% 
+  summarise(sum = across(-word, sum))
+return(reference_vec)
+}
+
+ml_ready <- data_vec %>% 
+  head(47600) %>% 
+  rowwise() %>% 
+  dplyr::mutate(vec = nest(sum_vector(text,word_vectors))) %>% 
+  select(review_pk, link, name, text, old_text, stars, vec) %>% 
+  unnest(vec) %>% 
+  unnest(data) %>% 
+  unnest(sum)
+
+```
+
+```{r, test page, eval = FALSE, echo = FALSE}
+# ls("package:recipes", pattern = "^step_")
+```
+
+### Modeling:
+
+#### Linear Model
+
+For our first model, we used a linear regression model. We use all 50 dimensions of the word vector space as our model input. Our initial expectations are that regression will be too simple to account for complex relationships which could appear in language. We run it anyway since it is a popular model type with which we can benchmark our improvements against.
+
+```{r, linear_regression, echo = FALSE}
+ml_split <- initial_split(ml_ready, prop = 0.8)
+ml_train <- rsample::training(ml_split)
+ml_test <- rsample::testing(ml_split)
+
+rec <- recipes::recipe(stars ~ ., data = ml_train) %>% 
+  recipes::step_rm(text, name, link, review_pk, old_text) %>% 
+  recipes::step_normalize(-stars) %>% 
+  recipes::prep()
+
+baked <- recipes::bake(rec, ml_train)
+
+rec <- recipes::recipe(stars ~ ., data = ml_test) %>% 
+  recipes::step_rm(text, name, link, review_pk, old_text) %>% 
+  recipes::step_normalize(-stars) %>% 
+  recipes::prep()
+
+baked_test <- recipes::bake(rec, ml_test)
+
+predict_rating <- parsnip::linear_reg(mode = "regression") %>% 
+  parsnip::set_engine("lm") %>% 
+  parsnip::fit(stars ~ ., data = baked)
+
+output_lm <- predict_rating %>% 
+  stats::predict(new_data = baked_test) %>% 
+  bind_cols(baked_test %>% dplyr::select(stars))
+
+lm_coeff <- parsnip::tidy(predict_rating)
+parsnip::glance(predict_rating) %>% dplyr::select(r.squared, adj.r.squared, sigma, p.value) %>%
+  dplyr::rename(R_Squared = r.squared, Adj_R_Squared = adj.r.squared, Sigma = sigma, P_Value = p.value) %>% 
+  kableExtra::kable(format = "markdown", size = "small") %>% 
+  kable_styling()
+
+output_lm %>% group_by(stars) %>% 
+  summarise(Average_Model_Prediction = mean(.pred),
+            SD_of_Predictions = sd(.pred),
+            .groups = "keep") %>% dplyr::rename(Stars_of_Test_Data = stars) %>% 
+  kableExtra::kable(format = "markdown", size = "small") %>% 
+  kable_styling()
+```
+
+We notice two things right away. Our r-squared is low, at around 30%. This means although it can beat a simple average by 30%, it’s likely not capturing the complex behavior we want it to. Secondly, when fed a subset of the data containing only one rating level (1-star, 2-star etc.), our model tends to overshoot. This reflects the fact that this model really can’t dynamically penalize a review which shows more evidence of being a negative review, beyond scaling the effects of the vector scaling coefficients. We at the very least, see higher variance for 1 star reviews, extending the possibility of a slightly lower prediction than 3 stars a little further.
+
+We’re not satisfied with these results. Because approximately 50% of reviews are five-star reviews, we want our model to beat that approximate 50% benchmark. Otherwise, we’re better off predicting every review as a 5-star review, and like they say in The Incredibles, if everyone is super, nobody is. Our model needs to, on occasion, decide to divert away from a 5-star score based on the information presented to it. We know it will take a bit of further work in order for it to do so because the accuracy achievable in the tail of the distribution is lower, and because the weighting to a 5-star evaluation is so high. Beating 50% accuracy would suggest our model can successfully identify non-5-star reviews, better than the loss of potentially misclassifying other 5-star reviews as something else. This is the kind of dynamic decision-making we are after. To accomplish this, we will use the Brulee engine set to a classification model.
+
+#### Brulee ML Classification Model
+
+```{r, echo = FALSE}
+ml_ready2 <- ml_ready
+ml_ready2$stars <- as.factor(ml_ready2$stars)
+ml_split <- ml_ready2 %>% initial_split(prop = 0.8)
+ml_train <- rsample::training(ml_split)
+ml_test <- rsample::testing(ml_split)
+
+rec <- recipes::recipe(stars ~ ., data = ml_train) %>% 
+  recipes::step_rm(text, name, review_pk, link, old_text) %>% 
+  recipes::step_normalize(-stars) %>% 
+  recipes::prep()
+
+baked <- recipes::bake(rec, ml_train)
+
+rec <- recipes::recipe(stars ~ ., data = ml_test) %>% 
+  recipes::step_rm(text, name, review_pk, link, old_text) %>% 
+  recipes::step_normalize(-stars) %>% 
+  recipes::prep()
+
+baked_test <- recipes::bake(rec, ml_test)
+
+predict_rating <- parsnip::mlp(mode = "classification") %>% 
+  parsnip::set_engine("brulee") %>% 
+  parsnip::fit(stars ~ ., data = baked)
+
+output <- predict_rating %>% 
+  stats::predict(new_data = baked_test) %>% 
+  bind_cols(baked_test %>% dplyr::select(stars))
+```
+
+```{r, echo = FALSE}
+df1 <- output %>% dplyr::mutate(success = case_when(.pred_class == stars ~ TRUE,
+                                             TRUE ~ FALSE)) %>%
+  group_by(stars) %>% 
+  summarise(Population = n(),
+            Successes = sum(success)) %>% 
+  dplyr::mutate(Success_Rate = Successes/Population)
+
+df2 <- output %>% dplyr::mutate(success = case_when(.pred_class == stars ~ TRUE,
+                                             TRUE ~ FALSE)) %>%
+  summarise(stars = "Total", Population = n(), Successes = sum(success), Success_Rate = sum(success)/n())
+
+rbind(df1,df2) %>% 
+  dplyr::rename(Stars = stars) %>% 
+  kableExtra::kable(format = "markdown", size = "small") %>% 
+  kable_styling()
+
+output %>% group_by(.pred_class) %>% 
+  summarise(Amount_Predicted = n()) %>% 
+  dplyr::rename(Stars = .pred_class) %>% 
+  kableExtra::kable(format = "markdown", size = "small") %>% 
+  kable_styling()
+
+#output %>% dplyr::mutate(sq_error = ((.pred_class %>% as.numeric()) - (stars %>% as.numeric()))^2) %>% 
+#  summarise(RMSE = (sum(sq_error)/n())^(1/2))
+```
+
+Once again, we see an overweighting towards the five-star ratings. No surprise there! Our machine learning can boost its performance by putting more emphasis on that segment. Its 87% success rate in the 5-star category (at the time of writing) is in large part due to the stubbornness of the model to shift the classification to any of the other options. However, we also see the model predicted a review score of 1 star 450 times, and predicted 4 stars 2105 times, which demonstrates the model will divert from a naive approach given satisfactory information is provided.. Our 8% improvement on the 50% accuracy naive benchmark demonstrates the ability of our model to identify the negative context in reviews and divert its predictions accordingly when enough evidence is present. For comparison, here is the overall success rate of the linear model when rounded to the nearest star:
+
+```{r, echo = FALSE}
+output_lm %>% dplyr::mutate(pred_rounded = case_when(.pred < 1.5 ~ 1,
+                                                     .pred < 2.5 ~ 2,
+                                                     .pred < 3.5 ~ 3,
+                                                     .pred < 4.5 ~ 4,
+                                                     TRUE ~ 5),
+                            success = pred_rounded == stars) %>%
+  summarise(Population = n(), Successes = sum(success), Success_Rate = sum(success)/n()) %>% 
+  kableExtra::kable(format = "markdown", size = "small") %>% 
+  kable_styling()
+```
+
+```{r, simplified_clissification, eval = FALSE, echo = FALSE}
+
+ml_ready2 <- ml_ready %>% dplyr::mutate(stars = case_when(stars %in% c(1,2,3,4)~1,
+                           TRUE ~ stars))
+ml_ready2$stars <- as.factor(ml_ready2$stars)
+
+ml_split <- ml_ready2 %>% initial_split(prop = 0.8)
+ml_train <- rsample::training(ml_split)
+ml_test <- rsample::testing(ml_split)
+
+rec <- recipes::recipe(stars ~ ., data = ml_train) %>% 
+  recipes::step_rm(text, name, review_pk, link, old_text) %>% 
+  recipes::step_normalize(-stars) %>% 
+  recipes::prep()
+
+baked <- recipes::bake(rec, ml_train)
+
+rec <- recipes::recipe(stars ~ ., data = ml_test) %>% 
+  recipes::step_rm(text, name, review_pk, link, old_text) %>% 
+  recipes::step_normalize(-stars) %>% 
+  recipes::prep()
+
+baked_test <- recipes::bake(rec, ml_test)
+
+predict_rating <- parsnip::mlp(mode = "classification") %>% 
+  parsnip::set_engine("brulee") %>% 
+  parsnip::fit(stars ~ ., data = baked)
+
+output <- predict_rating %>% 
+  stats::predict(new_data = baked_test) %>% 
+  bind_cols(baked_test %>% dplyr::select(stars))
+```
+
+```{r, echo = FALSE, eval = FALSE}
+df1 <- output %>% dplyr::mutate(success = case_when(.pred_class == stars ~ TRUE,
+                                             TRUE ~ FALSE)) %>%
+  group_by(stars) %>% 
+  summarise(Population = n(),
+            Successes = sum(success)) %>% 
+  dplyr::mutate(Success_Rate = Successes/Population)
+
+df2 <- output %>% dplyr::mutate(success = case_when(.pred_class == stars ~ TRUE,
+                                             TRUE ~ FALSE)) %>%
+  summarise(stars = "Total", Population = n(), Successes = sum(success), Success_Rate = sum(success)/n())
+
+rbind(df1,df2)
+
+output %>% group_by(.pred_class) %>% 
+  summarise(Amount_Predicted = n())
+
+output %>% dplyr::mutate(sq_error = ((.pred_class %>% as.numeric()) - (stars %>% as.numeric()))^2) %>% 
+  summarise(RMSE = (sum(sq_error)/n())^(1/2))
+```
+
+### Other Model Approaches
+
+Two other models were used in our analysis but were found to offer insignificant improvements. The first attempted to cluster 1 to 4 star reviews as a single class. The intuition behind this was that if the tail ends of the review distribution were harder to predict, instead treating them all as a single “bad review” class removes differences in people's politeness. We applied this to the ML classification model and found accuracy increased to around 72%. But by aggregating the non-binned model results after predictions, such that all 1 through 4-star predictions are categorically the same, the unbinned model still performed better. This is possibly due to the fact that the reduced approach forces the model to treat 4-star reviews the same as one and two-star reviews, even though the features for each class could look very different. Instead, it appears to be better to let the model learn the different unique characteristics of each rating group, and then weighing the model on its ability to classify five and non five star reviews successfully.
+
+Secondly, we expanded our feature set for the classification model to include the minimum and maximum (as well as the sum) of the vector ranges, such that the model input closer resembles a surface in the space as opposed to a single point. This resulted in slightly worse results, likely due to over fitting. This model likely wasn’t generalized enough to accommodate unpredictability in people's usage of language.
+
+```{r, warning = FALSE, eval = FALSE, echo = FALSE}
+vector2 <- function(text_in, dict){
+  reference_vec <- text_in %>% 
+  str_split(pattern = " ") %>% 
+  as.data.frame() %>% setNames("word") %>%  
+  left_join(dict, by = "word") %>% 
+  drop_na() %>% 
+  summarise(across(-word, list(min = min, max = max, sum = sum)))
+return(reference_vec)
+}
+
+ml_ready3 <- data_vec %>% 
+  head(47600) %>% 
+  rowwise() %>% 
+  dplyr::mutate(vec = nest(vector2(text,word_vectors))) %>% 
+  select(name, text, stars, vec) %>% 
+  unnest(vec) %>% 
+  unnest(data)
+
+```
+
+```{r, eval = FALSE, echo = FALSE}
+no_content <- ml_ready3 %>%
+  dplyr::filter(V2_min==Inf)
+```
+
+```{r, eval = FALSE, echo = FALSE}
+ml_ready3$stars <- as.factor(ml_ready3$stars)
+ml_split <- ml_ready3 %>% anti_join(no_content, by = "name") %>% 
+  initial_split(prop = 0.8)
+ml_train <- rsample::training(ml_split)
+ml_test <- rsample::testing(ml_split)
+
+rec <- recipes::recipe(stars ~ ., data = ml_train) %>% 
+  recipes::step_rm(text, name, review_pk, link) %>% 
+  recipes::step_normalize(-stars) %>% 
+  recipes::prep()
+
+baked <- recipes::bake(rec, ml_train)
+
+rec <- recipes::recipe(stars ~ ., data = ml_test) %>% 
+  recipes::step_rm(text, name, review_pk, link) %>% 
+  recipes::step_normalize(-stars) %>% 
+  recipes::prep()
+
+baked_test <- recipes::bake(rec, ml_test)
+
+predict_rating <- parsnip::mlp(mode = "classification") %>% 
+  parsnip::set_engine("brulee") %>% 
+  parsnip::fit(stars ~ ., data = baked)
+
+output <- predict_rating %>% 
+  stats::predict(new_data = baked_test) %>% 
+  bind_cols(baked_test %>% dplyr::select(stars))
+```
+
+```{r, eval = FALSE, echo = FALSE}
+df1 <- output %>% dplyr::mutate(success = case_when(.pred_class == stars ~ TRUE,
+                                             TRUE ~ FALSE)) %>%
+  group_by(stars) %>% 
+  summarise(Population = n(),
+            Successes = sum(success)) %>% 
+  dplyr::mutate(Success_Rate = Successes/Population)
+
+df2 <- output %>% dplyr::mutate(success = case_when(.pred_class == stars ~ TRUE,
+                                             TRUE ~ FALSE)) %>%
+  summarise(stars = "Total", Population = n(), Successes = sum(success), Success_Rate = sum(success)/n())
+
+rbind(df1,df2)
+
+output %>% group_by(.pred_class) %>% 
+  summarise(Amount_Predicted = n())
+
+output %>% dplyr::mutate(sq_error = ((.pred_class %>% as.numeric()) - (stars %>% as.numeric()))^2) %>% 
+  summarise(RMSE = (sum(sq_error)/n())^(1/2))
+```
+
+This is a good time to reinforce the idea that across people, we expect inconsistency between the contents of what people write, and how they score the review. The usefulness of what we are doing is to be able to later identify when a review doesn’t meet our predicted expectations, indicating certain semantic context that may deserve more focused attention, such as a recommendation wrapped in a 5-star review, or a customer comparing a restaurant to a less favorable competitor. Because of this, we do not necessarily want perfect 100% accuracy. We want evidence that the model is working as intended; we correctly score the general case and flag down the outlier case.
+
+### PCA
+
+Principal Component Analysis is a great tool to consider in a project like this, for one key reason especially; we don’t know what the dimensions of our vector space currently mean. We have 50 dimensions which mean… something. So when we rotate our data to a new coordinate system, we don’t lose much. What we gain is the ability to strip off the most or least influential factors recursively, as opposed to having a random axis with the word2vec space. First, let's check the range for each axis. Normalization shouldn’t be necessary since word2vec scales already:
+
+```{r, eval = FALSE, echo = FALSE}
+#temp <- ls()
+#temp <- temp[!(temp %in% c("word_vectors","data","ml_ready", "data_vec","lm_coeff"))]
+#rm(list = temp)
+
+n_check <- word_vectors %>% 
+  summarise(across(-word, list(max = max,min = min))) %>% 
+  transpose() %>% 
+  unlist() %>% 
+  as.data.frame() %>% 
+  dplyr::rename(range_bounds = names(.)[1]) %>% 
+  dplyr::mutate(row_id = row.names(.))
+
+n_check_l <- n_check %>% 
+  dplyr::filter(str_detect(row_id, pattern = "max")) %>% 
+  dplyr::mutate(row_id = row_id %>% str_replace("V","") %>% str_replace("_max","") %>% as.numeric()) %>% 
+  dplyr::rename(max = range_bounds)
+
+n_check_2 <- n_check %>% 
+  dplyr::filter(str_detect(row_id, pattern = "min")) %>% 
+  dplyr::mutate(row_id = row_id %>% str_replace("V","") %>% str_replace("_min","") %>% as.numeric()) %>% 
+  dplyr::rename(min = range_bounds)
+
+n_check <- left_join(n_check_l, n_check_2, by="row_id")
+
+n_check %>% ggplot() +
+  geom_point(aes(x = min, y = row_id))+
+  geom_point(aes(x = max, y = row_id))+
+  labs(x = "Value Range", y = "Axis (Dimensions 1 through 50)")
+```
+
+The real issue then becomes determining at what stage or level we can apply our principal component analysis to yield the most effective results. One potential approach could be to apply PCA to the initial vector word space. This would re-orientate all words in reviews into principal component space, with the first component accounting for the most variance and the last component accounting for the least.
+
+```{r, echo = FALSE}
+# Thanks Phil. - If it aint broke, don't fix it -
+max.PCs = 7
+
+
+pca <- word_vectors %>%
+  dplyr::select(-word) %>%
+  stats::prcomp(
+    scale = TRUE,
+    center = TRUE,
+    rank = max.PCs
+  )
+
+pca %>% summary()
+```
+
+This challenges one of our mental models. We assumed that because word2vec standardizes each feature (dimension in the vector space) it comes up with, when we run a PCA we expected an even spread in terms of variance captured. What this way of thinking fails to account for is that word2vec may be equipped to calculate a vector size too large for the corpus of information fed to it. In the absence of significant features to differentiate by, it splits its results along multiple axes, and likely aggregates them in strange ways. So coming out of this, word based PCA could be a viable approach.
+
+The second approach considered is to run a PCA on the sum of vectors calculated for each review. This allows for the PCA to address patterns in any compound features that emerge. One of the main ideas is that repeated cumulative effects from multiple words can lead to more pronounced features on a particular axis which wouldn’t be observable in the individual word space. Running a PCA afterward by review vector will likely yield different results than running it on the set of word vectors.
+
+```{r, echo = FALSE}
+max.PCs = 7
+
+
+pca <- ml_ready %>%
+  dplyr::select(-review_pk, -link, -name, -text, -stars, -old_text) %>%
+  stats::prcomp(
+    scale = TRUE,
+    center = TRUE,
+    rank = max.PCs
+  )
+
+pca %>% summary()
+```
+
+Bingo! The review sum of word vectors tends more towards a line than the individual components. As we can see, 51% of variance is explained by the first component, followed by 12% in the next component, and then 4% and decreasing. If our ML model wanted to account for this it would need to learn it on its own. Perhaps this will make the information easier to interpret by the model, since principal components isolate interrelationships between different dimensions. If our model has to learn these relationships on its own when using the unrotated data, perhaps rotating our data with PCA will give it an advantage when training and making predictions.
+
+### PCA Transformed Classification Model
+
+```{r, echo = FALSE}
+# credit to you Phil for the tidymodel PCA, r-studio
+
+# Optimized 
+
+df <- ml_ready %>% dplyr::select(-review_pk, -link, -name, -text, -stars, -old_text)
+rec <- df %>% recipes::recipe(~ .)
+pca_trans <- rec %>%
+  recipes::step_center(all_numeric()) %>%
+  recipes::step_scale(all_numeric()) %>%
+  recipes::step_pca(all_numeric(), num_comp = 50)
+pca_estimates <- recipes::prep(pca_trans, training = df)
+pca <- bake(pca_estimates, df)
+pca <- pca %>% dplyr::mutate(review_pk = 1, review_pk = cumsum(review_pk))
+ml_ready_pca <- ml_ready %>% dplyr::select(review_pk, link, name, text, stars, old_text)
+ml_ready_pca <- left_join(ml_ready_pca, pca, by = "review_pk")
+
+ml_ready_pca$stars <- as.factor(ml_ready_pca$stars)
+ml_split <- ml_ready_pca %>% initial_split(prop = 0.8)
+ml_train <- rsample::training(ml_split)
+ml_test <- rsample::testing(ml_split)
+
+rec <- recipes::recipe(stars ~ ., data = ml_train) %>% 
+  recipes::step_rm(text, name, review_pk, link, old_text) %>% 
+  recipes::step_normalize(-stars) %>% 
+  recipes::prep()
+
+baked <- recipes::bake(rec, ml_train)
+
+rec <- recipes::recipe(stars ~ ., data = ml_test) %>% 
+  recipes::step_rm(text, name, review_pk, link, old_text) %>% 
+  recipes::step_normalize(-stars) %>% 
+  recipes::prep()
+
+baked_test <- recipes::bake(rec, ml_test)
+
+predict_rating <- parsnip::mlp(mode = "classification") %>% 
+  parsnip::set_engine("brulee") %>% 
+  parsnip::fit(stars ~ ., data = baked)
+
+output <- predict_rating %>% 
+  stats::predict(new_data = baked_test) %>% 
+  bind_cols(baked_test %>% dplyr::select(stars))
+
+df1 <- output %>% dplyr::mutate(success = case_when(.pred_class == stars ~ TRUE,
+                                             TRUE ~ FALSE)) %>%
+  group_by(stars) %>% 
+  summarise(Population = n(),
+            Successes = sum(success)) %>% 
+  dplyr::mutate(Success_Rate = Successes/Population)
+
+df2 <- output %>% dplyr::mutate(success = case_when(.pred_class == stars ~ TRUE,
+                                             TRUE ~ FALSE)) %>%
+  summarise(stars = "Total", Population = n(), Successes = sum(success), Success_Rate = sum(success)/n())
+
+rbind(df1,df2) %>% 
+  dplyr::rename(Stars = stars) %>% 
+  kableExtra::kable(format = "markdown", size = "small") %>% 
+  kable_styling()
+
+output %>% group_by(.pred_class) %>% 
+  summarise(Amount_Predicted = n()) %>% 
+  dplyr::rename(Class_Predicted = .pred_class) %>% 
+  kableExtra::kable(format = "markdown", size = "small") %>% 
+  kable_styling()
+
+#output %>% dplyr::mutate(sq_error = ((.pred_class %>% as.numeric()) - (stars %>% as.numeric()))^2) %>% 
+#  summarise(RMSE = (sum(sq_error)/n())^(1/2))
+
+output_pca <- bind_cols(output %>% dplyr::select(.pred_class), ml_test)
+```
+
+From our all-stars classification model, we manage to squeeze the tiniest bit more accuracy out of it, which approaches and sometimes exceeds 59% accuracy (at the time of writing). But here's the next advantage of the PCA analysis. We can also strip components from the model on the basis of their contribution to total variance, which may lead to more generalization and less over-fitting. Let's try removing the first principal component. The idea here is to determine whether we can determine review score better using only residual information.
+
+### PCA Transformed Classification Model, PC01 Removed
+
+```{r, echo = FALSE}
+ml_ready_pca$stars <- as.factor(ml_ready_pca$stars)
+ml_split <- ml_ready_pca %>% initial_split(prop = 0.8)
+ml_train <- rsample::training(ml_split)
+ml_test <- rsample::testing(ml_split)
+
+rec <- recipes::recipe(stars ~ ., data = ml_train) %>% 
+  recipes::step_rm(text, name, review_pk, link, PC01, old_text) %>% 
+  recipes::step_normalize(-stars) %>% 
+  recipes::prep()
+
+baked <- recipes::bake(rec, ml_train)
+
+rec <- recipes::recipe(stars ~ ., data = ml_test) %>% 
+  recipes::step_rm(text, name, review_pk, link, PC01, old_text) %>% 
+  recipes::step_normalize(-stars) %>% 
+  recipes::prep()
+
+baked_test <- recipes::bake(rec, ml_test)
+
+predict_rating <- parsnip::mlp(mode = "classification") %>% 
+  parsnip::set_engine("brulee") %>% 
+  parsnip::fit(stars ~ ., data = baked)
+
+output <- predict_rating %>% 
+  stats::predict(new_data = baked_test) %>% 
+  bind_cols(baked_test %>% dplyr::select(stars))
+
+df1 <- output %>% dplyr::mutate(success = case_when(.pred_class == stars ~ TRUE,
+                                             TRUE ~ FALSE)) %>%
+  group_by(stars) %>% 
+  summarise(Population = n(),
+            Successes = sum(success)) %>% 
+  dplyr::mutate(Success_Rate = Successes/Population)
+
+df2 <- output %>% dplyr::mutate(success = case_when(.pred_class == stars ~ TRUE,
+                                             TRUE ~ FALSE)) %>%
+  summarise(stars = "Total", Population = n(), Successes = sum(success), Success_Rate = sum(success)/n())
+
+rbind(df1,df2) %>% 
+  dplyr::rename(Stars = stars) %>% 
+  kableExtra::kable(format = "markdown", size = "small") %>% 
+  kable_styling()
+
+output %>% group_by(.pred_class) %>% 
+  summarise(Amount_Predicted = n()) %>% 
+  dplyr::rename(Class_Predicted = .pred_class) %>% 
+  kableExtra::kable(format = "markdown", size = "small") %>% 
+  kable_styling()
+
+#output %>% dplyr::mutate(sq_error = ((.pred_class %>% as.numeric()) - (stars %>% as.numeric()))^2) %>% 
+#  summarise(RMSE = (sum(sq_error)/n())^(1/2))
+```
+
+Interestingly enough, we can get rid of the first principal component, but have observed mixed results where it under performs or over performs compared to the baseline model. At this point, we really don't expect any higher results from our model. Remember, the reason this model is useful to begin with is it provides a way to classify reviews fairly from their text content. Our measures of model accuracy support the idea that our model is either slightly improving or not changing in terms of effectiveness. If we actually achieved 100%, our model wouldn't be useful for its end purpose, due to the different temperaments of different reviewers. We are getting to a point where we are comfortable our model can highlight key text which is "mislabeled" by the reviewer, which can either write up the rating of the restaurant to a fair level, or perhaps more usefully, identify high-scoring reviews from your more loyal patrons that perhaps have more information about how you (as a restaurant could improve than you think. Note that for this purpose, our best model thus far is the PCA classification 1 through 5 model, which performs on par with our non PCA classification model, and outperforms the 5/Non-5-Star classification model as well.
+
+### Misclassified 5-Star Reviews
+
+Let’s use this model to find 5-star reviews that the model didn’t classify correctly:
+
+```{r, eval = FALSE, echo = FALSE}
+
+# Find and read misclassified 5-star reviews
+
+index_list <- output_pca %>% dplyr::filter(stars == 5 & !.pred_class==stars) %>% .$review_pk
+print_review <- data_vec %>% dplyr::filter(review_pk %in% index_list)
+print_review$old_text[5]
+print_review$text[1]
+
+
+```
+
+```{r, echo = FALSE}
+# If interested, take a look at the indexing in the code above. You'll get a sense of how frequently our misclassified 5 star reviews occur.
+
+data_vec$old_text[53] %>% pander()
+```
+
+```{r, echo = FALSE}
+data_vec$old_text[404] %>% pander()
+```
+
+Not all reviews are correctly misclassified due to a spoken issue. Many occurrences of the phrase “not disappointed” showed up, which makes sense because, after the removal of stop words, it simply shows up as “disappointed”. This provides us with one final angle of attack for improving our model’s accuracy, which we will tackle later in the valence shifters section. However, we do identify some very interesting suggestions from some of the reviewers. The two above appeared as 5-star reviews predicted as lower scores by our model. The first offers an earnest suggestion to improve wifi service but rated the place five stars anyways. The second involves a very theatrical incident where someone's daughter got locked in the washroom due to the lock jamming. Despite the 5-star review, we can easily see the negative context here. Both of these reviews provide critical feedback to the restaurant, and would be lost by management if they focused solely on 1-3 star reviews to seek areas of improvement. . What’s better, is this is information about present issues coming from patrons who are much more likely to return, increasing the impact of the potential improvements. Each of these examples came from the first 10 mis-classified 5-star reviews on the first run of this model.
+
+### Clustering
+
+We wanted to take a little time to explore our word space a bit more before the final section, so any reader can walk away feeling confident of the capabilities of vectorization in a machine learning context. . It’s easy to look at the vector input for the predictive models as nebulous structures that can’t be understood. Exploration through clustering builds a much more intuitive picture of how vector addition leads to suitable predictions. Additionally, it provides a useful means of building dictionaries for various sub-topics enabling restaurant owners to gauge consumer trends.
+
+We will use k-means clustering to group different words into sets. Note the lack of need for normalization due to consistent axis ranges for our vectors. The following 3 graphs show 3 layers of clustering. The first layer of clustering captures large groups and removes larger bands of empty space in the data. The second cluster captures subgroups within the first set of clustering. Because the first round of clustering removed the consideration of empty space between the groups, the sub-clusters don’t have to optimize for other words very far away, since they are allocated to other clusters. This leads to a better fit than simply running many clusters at the macro level. Finally, the sub-clustering is repeated creating a third tier in the hierarchy.
+
+#### Clustering Tier 1
+
+```{r, classification_rework, echo = FALSE}
+word_cluster_in <- word_vectors %>% column_to_rownames(var = "word")
+# fviz_nbclust(word_cluster_in, FUNcluster = kmeans, method = "silhouette")
+fviz_cluster(word_cluster_in %>% kmeans(centers = 6), data = word_cluster_in)
+cluster_model <- kmeans(word_cluster_in, centers = 6) %>% 
+  .$cluster %>% as.data.frame() %>% 
+  rownames_to_column() %>% 
+  rename(cluster = names(.)[2], word = rowname) %>% 
+  left_join(word_vectors, by = "word")
+```
+
+```{r, eval = FALSE, echo = FALSE}
+cluster_slice_by_word <- function(w, cm, x){
+  i <- cm %>% dplyr::filter(word == w)
+
+  p <- cm %>% 
+    dplyr::filter(cluster == i$cluster) %>% 
+    dplyr::filter(V3 < i$V3 + x) %>% 
+    dplyr::filter(V3 > i$V3 - x) %>% 
+    ggplot() +
+    geom_text(aes(x=V1, y=V2, label=word)) +
+    labs(title = paste0("From cluster ",i$cluster),subtitle = w)
+  return(p)
+}
+
+cluster_slice_by_word("vodka", cluster_model, 0.2)
+cluster_slice_by_word("beef", cluster_model, 0.05)
+```
+
+```{r, warning = FALSE, echo = FALSE}
+for(c in 1:(cluster_model$cluster %>% unique() %>% length())){
+  data_in <- cluster_model %>% 
+    dplyr::filter(cluster == c) %>% 
+    column_to_rownames(var = "word") %>% 
+    dplyr::select(-cluster)
+  
+  # can be expanded to evaluate all subclusters (tier 2 clusters)
+  if(c<2){
+    # fviz_nbclust(data_in, FUNcluster = kmeans, method = "silhouette") %>% print()
+    # fviz_cluster(data_in %>% kmeans(centers = 5), data = data_in) %>% print()
+  }
+  
+  cm_bind <- kmeans(data_in, centers = 7) %>% .$cluster %>% as.data.frame() %>% rownames_to_column() %>%
+    dplyr::rename(sub_clust = names(.)[2], word = rowname)
+  if(c==1){
+    cm_out <- cm_bind
+  } else {
+    cm_out <- rbind(cm_out, cm_bind)
+  }
+}
+
+sub_cluster_model <- left_join(cm_out, cluster_model, by = "word")
+```
+
+```{r, warning = FALSE, echo = FALSE, eval = FALSE}
+sub_cluster_model %>% 
+  dplyr::mutate(clust_subclust = paste0(cluster, "_", sub_clust)) %>% 
+  group_by(clust_subclust) %>% 
+  summarise(n = n(), .groups = "keep")
+```
+
+```{r, sub_cluster_model, warning = FALSE, echo = FALSE}
+i <- sub_cluster_model %>% 
+  dplyr::filter(word=="merlot")
+
+drinks <- sub_cluster_model %>% dplyr::filter(cluster == i$cluster & sub_clust == i$sub_clust)
+
+# drinks %>% tail(15) %>% dplyr::select(word, cluster, sub_clust)
+```
+
+#### Clustering Tier 3
+
+```{r, echo = FALSE, warning = FALSE}
+data_in <- drinks %>% column_to_rownames(var = "word") %>% dplyr::select(-sub_clust, -cluster)
+#fviz_nbclust(data_in, FUNcluster = kmeans, method = "silhouette", k.max = 20) %>% print()
+fviz_cluster(data_in %>% kmeans(centers = 9), data = data_in) %>% print()
+
+cm_bind <- kmeans(data_in, centers = 9) %>% .$cluster %>% as.data.frame() %>% rownames_to_column() %>%
+    dplyr::rename(drink_clust = names(.)[2], word = rowname)
+drinks2 <- left_join(cm_bind, drinks, by = "word") %>% dplyr::select(word, drink_clust)
+
+#i <- drinks2 %>% dplyr::filter(word == "merlot")
+#wine <- drinks2 %>% dplyr::filter(drink_clust == i$drink_clust)
+```
+
+Above is one of the most unique clusters we’ve identified. It contains many kinds of drinks, from wines to cocktails we’ve never heard of. The consistency of this subset speaks to vectorization capabilities in capturing word context. This case also justifies our use of skip-gram modeling as opposed to using a continuous bag of words, since even drinks that appear only a few times in reviews still get classified correctly due to similar surrounding context.
+
+#### Choose a drink from our menu:
+
+```{r, echo = FALSE}
+drinks %>% dplyr::select(word) %>% 
+  kableExtra::kable(format = "markdown", size = "small") %>% 
+  kable_styling() %>% 
+  scroll_box(width = "500px", height = "400px")
+```
+
+These cluster classes allow for other kinds of data analysis as well. It lets us reasonably get a search dictionary for certain topics that may be impractical to assemble by hand.
+
+```{r, echo = FALSE}
+count_dict <- function(review, dictionary){
+  
+  #counts the number of occurrences of words in sample text to that in a dictionary
+  
+  w_review <- review %>% 
+    str_replace_all(pattern = '[.,/()"!?+]', replacement = "") %>% 
+    str_replace_all("[ ]+", replacement = " ") %>% 
+    str_split(pattern = " ") %>%
+    unlist()
+  
+  count <- 0
+  
+  for(w in w_review){
+    if(w %in% dictionary){
+      count <- count + 1
+    }
+  }
+  return(count)
+}
+
+data_vec <- data_vec %>% 
+  rowwise() %>% dplyr::mutate(drinks_mentioned = text %>% count_dict(drinks$word),
+                              mentioned_drinks = drinks_mentioned > 0)
+drink_serving_rest <- data_vec %>% group_by(link) %>% 
+  summarise(drinks_proportion = sum(mentioned_drinks) / n(),
+            reviews = n()) %>% 
+  left_join(data_vec %>% dplyr::select(name, link, rating) %>% distinct(), by = "link") %>% 
+  dplyr::select(name, drinks_proportion, rating, reviews, link) %>% 
+  arrange(desc(reviews)) %>% 
+  arrange(desc(drinks_proportion)) %>% 
+  dplyr::filter(reviews > 30)
+```
+
+```{r, eval = FALSE, echo = FALSE}
+drink_serving_rest %>% ggplot()+
+  geom_histogram(aes(x = drinks_proportion, y = ..count../sum(..count..)), bins = 100) +
+  labs(x = "Proportion of reviews mentioning drinks",y = "Density")
+```
+
+```{r, eval = FALSE, echo = FALSE}
+data_vec <- data_vec %>% dplyr::mutate(wine_words = text %>% count_dict(wine$word), wine_mentioned = wine_words > 0)
+
+wine_rest <- data_vec %>% group_by(link) %>% 
+  summarise(wine_prop = sum(wine_mentioned) / n(),
+            reviews = n()) %>% 
+  left_join(data_vec %>% dplyr::select(name, link, rating) %>% distinct(), by = "link") %>% 
+  dplyr::select(name, wine_prop, rating, reviews) %>% 
+  arrange(desc(reviews)) %>% 
+  arrange(desc(wine_prop)) %>% 
+  dplyr::filter(reviews > 15)
+wine_rest
+```
+
+Have drinking patterns changed over time?
+
+```{r, echo = FALSE}
+drinks_over_time <- data_vec %>% dplyr::mutate(date = review_date %>% as.Date(format = "%b %d, %Y"),
+                                   month = month(date), 
+                                   year = year(date), 
+                                   yearmonth = year + month/12) %>% 
+  group_by(yearmonth) %>% 
+  dplyr::summarise(
+    Prop_Drinks = sum(mentioned_drinks)/n(),
+    .groups = "keep"
+  ) %>% 
+  arrange(desc(yearmonth))
+
+drinks_over_time %>% ggplot()+
+  geom_point(aes(x = yearmonth, y = Prop_Drinks))+
+  labs(x = "Year", 
+       y = "Proportion of Reviews Referencing Drinks",
+       title = "Prevalence of drinks as a review feature")
+```
+
+We find a nice distinctive downward trend over time. Keep in mind the multitude of possible causes. People could be drinking less, but they could also be visiting restaurants without serving liquor more. They could be reviewing more restaurants without liquor involved in the experience. They could also be talking about drinking less because social norms have changed and it’s become more taboo. Fewer restaurants could be serving liquor, or they do less to promote their liquor menus due to Pro-Serve regulations.
+
+```{r, eval = FALSE, echo = FALSE}
+drinks_over_time %>% dplyr::mutate(year = yearmonth %>% floor(), month = (yearmonth - year)*12+1) %>% 
+  arrange(month) %>% 
+  ggplot(aes(col = year %>% as.character(), group = year %>% as.character())) + geom_line(aes(x = month, y = Prop_Drinks)) + labs(x = "Month", y = "Proportion of Reviews Mentioning Drinks")+
+  guides(color = guide_legend(title = "")) +
+  scale_x_continuous(breaks= pretty_breaks())
+
+drinks_over_time %>% 
+  dplyr::mutate(year = yearmonth %>% floor(), month = (yearmonth - year)*12+1) %>% 
+  group_by(year) %>% 
+  dplyr::mutate(Prop_Drinks_Normalized = Prop_Drinks/mean(Prop_Drinks)) %>% 
+  dplyr::ungroup() %>% 
+  ggplot(aes(col = year %>% as.character(), group = year %>% as.character())) + geom_line(aes(x = month, y = Prop_Drinks_Normalized)) + labs(x = "Month", y = "Normalized Drinks Reviews Score") +
+  guides(color = guide_legend(title = "")) +
+  scale_x_continuous(breaks= pretty_breaks())
+# https://www.geeksforgeeks.org/how-to-change-legend-title-in-ggplot2-in-r/
+# https://stackoverflow.com/questions/15622001/how-to-display-only-integer-values-on-an-axis-using-ggplot2
+```
+
+```{r, eval = FALSE, echo = FALSE}
+data_vec <- left_join(data_vec, drink_serving_rest %>% dplyr::select(-name, -rating, -reviews), by = "link")
+
+
+```
+
+```{r, eval = FALSE, echo = FALSE}
+v_sub <- lm_coeff %>% dplyr::mutate(estimate = abs(estimate)) %>% 
+  dplyr::filter(p.value < 0.01) %>%
+  tail(-1) %>%
+  dplyr::arrange(desc(estimate))
+
+v_sub %>% head(12)
+v_sub <- v_sub %>% tail(-12)
+
+v_sub <- v_sub$term
+v_sub
+```
+
+```{r, eval = FALSE, echo = FALSE}
+# Outdated model which uses drink proportion classifier. Decreased model performance.
+
+ml_ready2 <- ml_ready %>% 
+  left_join(data_vec %>% 
+            select(mentioned_drinks, drinks_proportion, review_pk), 
+            by = "review_pk") %>% 
+  dplyr::mutate(mentioned_drinks = case_when(mentioned_drinks ~ 1,
+                                             TRUE ~ 0))
+ml_ready2$stars <- as.factor(ml_ready2$stars)
+ml_split <- ml_ready2 %>% initial_split(prop = 0.8)
+ml_train <- rsample::training(ml_split)
+ml_test <- rsample::testing(ml_split)
+
+rec <- recipes::recipe(stars ~ ., data = ml_train) %>% 
+  recipes::step_rm(text, name, link, review_pk, V25, V5, V40, V7, V4, V16, V43, V22, V2, V30, V6, V8, V26, V37, V28, V27, V24, V15, V19, V14, V45, V17, V23, V42, V18, V13, V12, V39) %>% 
+  recipes::step_normalize(-stars) %>% 
+  recipes::prep()
+baked <- recipes::bake(rec, ml_train)
+
+rec <- recipes::recipe(stars ~ ., data = ml_test) %>% 
+  recipes::step_rm(text, name, link, review_pk, V25, V5, V40, V7, V4, V16, V43, V22, V2, V30, V6, V8, V26, V37, V28, V27, V24, V15, V19, V14, V45, V17, V23, V42, V18, V13, V12, V39) %>% 
+  recipes::step_normalize(-stars) %>% 
+  recipes::prep()
+
+baked_test <- recipes::bake(rec, ml_test)
+
+predict_rating <- parsnip::mlp(mode = "classification", hidden_units = 4L, epochs = 200L, learn_rate = 0.020) %>% 
+  parsnip::set_engine("brulee") %>% 
+  parsnip::fit(stars ~ ., data = baked)
+
+output <- predict_rating %>% 
+  stats::predict(new_data = baked_test) %>% 
+  bind_cols(baked_test %>% dplyr::select(stars))
+```
+
+```{r, eval = FALSE, echo = FALSE}
+df1 <- output %>% dplyr::mutate(success = case_when(.pred_class == stars ~ TRUE,
+                                             TRUE ~ FALSE)) %>%
+  group_by(stars) %>% 
+  summarise(Population = n(),
+            Successes = sum(success)) %>% 
+  dplyr::mutate(Success_Rate = Successes/Population)
+
+df2 <- output %>% dplyr::mutate(success = case_when(.pred_class == stars ~ TRUE,
+                                             TRUE ~ FALSE)) %>%
+  summarise(stars = "Total", Population = n(), Successes = sum(success), Success_Rate = sum(success)/n())
+
+rbind(df1,df2)
+
+output %>% group_by(.pred_class) %>% 
+  summarise(Amount_Predicted = n())
+
+output %>% dplyr::mutate(sq_error = ((.pred_class %>% as.numeric()) - (stars %>% as.numeric()))^2) %>% 
+  summarise(RMSE = (sum(sq_error)/n())^(1/2))
+```
+
+We hope by this point you see the value in vectorization, and its robust ability to contextualize words into an analyzable format.
+
+### Valence Words
+
+Up to this point, we’ve looked at each word independently of one another, without accounting for n-gram token relationships. When we filtered for 5-star reviews mis-classified as lower ratings, we noticed a high prevalence of the phrase “not disappointed”. A quick inspection revealed the issue: "not" is a stop word, so it was dropped immediately. Since it would appear "disappointed" appears in more negative reviews than positive, the lack of adjustment for the word not flipping its meaning caused the problem. ‘Not’ is an example of a valence shifter. It modifies the meaning of a word near to it, in this case, flipping the meaning.
+
+We want to account primarily for the inversional valence shifters. We specifically want the words that invert the meaning of the word they are beside… words such as \[not, no, ain’t, wasn’t\], etc. One approach considered was to take the vector for the anchor word, and multiply it by negative one before adding it to the review vector sum. This runs into a problem: because word2vec is trained without any of the stop words, the anchor word is displaced by occurring in opposite semantic contexts but being considered the same entity. Instead, we decided to concatenate the word not to any word besides an inversional valence shifter. The phrase:
+
+"This food aint good"
+
+Becomes:
+
+"This food notgood"
+
+**Notgood** becomes its own word treated separately in the word2vec process. Why do we want this? Consider the following four phrases: “Not Good”, “Not Bad”, “Good”, and “Bad”. All 4 have different meanings. Something which is good is better than something that is not bad. Something which is not good is better than something that is bad. The slight difference in meanings comes from the subtext of each word. Because of that, multiplying vectors by -1 in the presence of an inversional valence shifter would lead to a distortion. Word2vec can now contextualize valence-shifted phrases independently.
+
+We rerun our entire model top to bottom, this time adjusting pre-processing to account for valence shifters with an apostrophe. Vectorization, PCA, and model training remain unchanged:
+
+```{r, echo = FALSE}
+library(lexicon)
+
+#hash_valence_shifters
+
+valence_list <- c("ain't", "aint", "aren't", "arent", "barely", "can't", "cannot", "couldn't", "couldnt", "didn't", "didnt", "doesn't", "doesnt", "don't", "dont", "isn't", "isnt", "not", "nor", "shouldn't", "shouldnt", "wasn't", "wasnt", "weren't", "werent", "no")
+
+# word_vectors2 %>% dplyr::filter(word %in% valence_list)
+
+
+# Maintains the same processing workflow for data_vec prior to word2vec, however this time the stop_words removed are different to leave key valence shifters intact. 
+
+data_vec <- data_vec %>% dplyr::mutate(vtext = old_text,
+                                       vtext = str_replace(vtext %>% tolower(),
+                                   pattern = name %>% tolower(),
+                                   replacement = "~RestuarantName~") %>% tolower(),
+                vtext = vtext %>% str_replace_all(pattern = "[0-9]+[:-][0-9]+[a][m]", replacement = "timecode"),
+                vtext = vtext %>% str_replace_all(pattern = "don't", replacement = "dont"),
+                vtext = vtext %>% str_replace_all(pattern = "ain't", replacement = "aint"),
+                vtext = vtext %>% str_replace_all(pattern = "aren't", replacement = "arent"),
+                vtext = vtext %>% str_replace_all(pattern = "can't", replacement = "cant"),
+                vtext = vtext %>% str_replace_all(pattern = "couldn't", replacement = "couldnt"),
+                vtext = vtext %>% str_replace_all(pattern = "didn't", replacement = "didnt"),
+                vtext = vtext %>% str_replace_all(pattern = "doesn't", replacement = "doesnt"),
+                vtext = vtext %>% str_replace_all(pattern = "isn't", replacement = "isnt"),
+                vtext = vtext %>% str_replace_all(pattern = "shouldn't", replacement = "shouldnt"),
+                vtext = vtext %>% str_replace_all(pattern = "wasn't", replacement = "wasnt"),
+                vtext = vtext %>% str_replace_all(pattern = "weren't", replacement = "werent"),
+                vtext = vtext %>% str_replace_all(pattern = "[0-9]+[:-][0-9]+[p][m]", replacement = "timecode"),
+                vtext = vtext %>% str_replace_all(pattern = "[0-9]+[a][m]", replacement = "timecode"),
+                vtext = vtext %>% str_replace_all(pattern = "[0-9]+[p][m]", replacement = "timecode"),
+                vtext = vtext %>% str_replace_all(pattern = "[0-9]+[o][z]", replacement = "drinksize"),
+                vtext = vtext %>% str_replace_all(pattern = "[0-9]+[.][0-9]+\\/[0-9]+", replacement = "decifractional"),
+                vtext = vtext %>% str_replace_all(pattern = "[0-9]+\\/[0-9]+", replacement = "fractional"),
+                vtext = vtext %>% str_replace_all(pattern = "[0-9]+[.][0-9]+", replacement = "decimalnumber"),
+                vtext = gsub("([A-z]+)\\.([A-z]+)", "\\1. \\2",vtext),
+                vtext = gsub("([0-9]+)(mins)", "\\1 min",vtext),
+                vtext = gsub("([0-9]+)(min)", "\\1 min",vtext),
+                vtext = gsub("([0-9]+)([A-z]+)", "\\1 \\2",vtext),
+                vtext = gsub("([0-9]+),([0-9]+)", "\\1\\2",vtext),
+                vtext = vtext %>% str_replace_all(pattern = "[0-9][0-9][0-9][0-9]", replacement = "numthousands"),
+                vtext = vtext %>% str_replace_all(pattern = "[0-9][0-9][0-9]", replacement = "numhundreds"))
+
+for(v in valence_list){
+  data_vec <- data_vec %>% dplyr::mutate(vtext = gsub(paste0(v, " ([A-z]+)"), "not\\1", vtext))
+}
+
+data_vec <- data_vec %>% dplyr::mutate(vtext = vtext %>% removeWords(stop_words$word))
+
+model2 <- word2vec(data_vec$vtext, type = "skip-gram")
+word_vectors2 <- as.matrix(model2) %>% as.data.frame() %>% rownames_to_column() %>% dplyr::rename(word = rowname)
+```
+
+```{r, echo = FALSE}
+ml_ready4 <- data_vec %>% 
+  head(47600) %>% 
+  rowwise() %>% 
+  dplyr::mutate(vec = nest(sum_vector(vtext,word_vectors2))) %>% 
+  select(review_pk, link, name, text, old_text, stars, vec) %>% 
+  unnest(vec) %>% 
+  unnest(data) %>% 
+  unnest(sum)
+```
+
+```{r, echo = FALSE}
+df <- ml_ready4 %>% dplyr::select(-review_pk, -link, -name, -text, -stars, -old_text)
+rec <- df %>% recipes::recipe(~ .)
+pca_trans <- rec %>%
+  recipes::step_center(all_numeric()) %>%
+  recipes::step_scale(all_numeric()) %>%
+  recipes::step_pca(all_numeric(), num_comp = 50)
+pca_estimates <- recipes::prep(pca_trans, training = df)
+pca <- bake(pca_estimates, df)
+pca <- pca %>% dplyr::mutate(review_pk = 1, review_pk = cumsum(review_pk))
+ml_ready_pca <- ml_ready %>% dplyr::select(review_pk, link, name, text, stars, old_text)
+ml_ready_pca <- left_join(ml_ready_pca, pca, by = "review_pk")
+
+ml_ready_pca$stars <- as.factor(ml_ready_pca$stars)
+ml_split <- ml_ready_pca %>% initial_split(prop = 0.8)
+ml_train <- rsample::training(ml_split)
+ml_test <- rsample::testing(ml_split)
+
+rec <- recipes::recipe(stars ~ ., data = ml_train) %>% 
+  recipes::step_rm(text, name, review_pk, link, old_text) %>% 
+  recipes::step_normalize(-stars) %>% 
+  recipes::prep()
+
+baked <- recipes::bake(rec, ml_train)
+
+rec <- recipes::recipe(stars ~ ., data = ml_test) %>% 
+  recipes::step_rm(text, name, review_pk, link, old_text) %>% 
+  recipes::step_normalize(-stars) %>% 
+  recipes::prep()
+
+baked_test <- recipes::bake(rec, ml_test)
+
+predict_rating <- parsnip::mlp(mode = "classification") %>% 
+  parsnip::set_engine("brulee") %>% 
+  parsnip::fit(stars ~ ., data = baked)
+
+output <- predict_rating %>% 
+  stats::predict(new_data = baked_test) %>% 
+  bind_cols(baked_test %>% dplyr::select(stars))
+
+df1 <- output %>% dplyr::mutate(success = case_when(.pred_class == stars ~ TRUE,
+                                             TRUE ~ FALSE)) %>%
+  group_by(stars) %>% 
+  summarise(Population = n(),
+            Successes = sum(success)) %>% 
+  dplyr::mutate(Success_Rate = Successes/Population)
+
+df2 <- output %>% dplyr::mutate(success = case_when(.pred_class == stars ~ TRUE,
+                                             TRUE ~ FALSE)) %>%
+  summarise(stars = "Total", Population = n(), Successes = sum(success), Success_Rate = sum(success)/n())
+
+rbind(df1,df2) %>% 
+  dplyr::rename(Stars = stars) %>% 
+  kableExtra::kable(format = "markdown", size = "small") %>% 
+  kable_styling()
+
+output %>% group_by(.pred_class) %>% 
+  summarise(Amount_Predicted = n()) %>% 
+  dplyr::rename(Class_Predicted = .pred_class) %>% 
+  kableExtra::kable(format = "markdown", size = "small") %>% 
+  kable_styling()
+
+#output %>% dplyr::mutate(sq_error = ((.pred_class %>% as.numeric()) - (stars %>% as.numeric()))^2) %>% 
+#  summarise(RMSE = (sum(sq_error)/n())^(1/2))
+
+output_pca <- bind_cols(output %>% dplyr::select(.pred_class), ml_test)
+```
+
+```{r, echo = FALSE}
+
+# Find and read misclassified 5 star reviews
+
+index_list <- output_pca %>% dplyr::filter(stars == 5 & !.pred_class==stars) %>% .$review_pk
+print_review <- data_vec %>% dplyr::filter(review_pk %in% index_list)
+#print_review$old_text[1]
+#print_review$vtext[1]
+```
+
+Depending on the sampling of the training and test set, results will vary. But we've seen this do as well as 59.5% accuracy on multiple occasions, which significantly improves on the typical results of the previous models. Regardless, in some instances the results will be inverted in comparison to our previous models. This also addresses issues found through qualitative means. We now expect five star reviews which use phrases such as "not disappointed" to appear less in our misclassified set, increasing the odds misclassified reviews contain useful critiques for management.
+
+## Conclusion
+
+Text analytics on large data sets is no cakewalk, and using that text to make predictions is a lengthy process with uncertain results. It can be done, however, and in this case, the occurrence of an incorrect prediction can be a useful feature if used cleverly. We were successfully able to improve our predictions over our regression model baseline, and prove our model can behave in a non-naive fashion that can recognize non-5-star reviews. We were able to use vectorization and clustering to develop new search dictionaries tailored to the industry of interest and use those dictionaries to track changes in consumer interest. Finally, we were able to explore the merits of various process tunings in an attempt to improve model consistency. Our final model allows managers to identify 5-star reviews with critical feedback quicker that sifting through all 5-star reviews by hand. More examples of misclassified 5-star reviews can be found below in the appendix.
+
+## Appendix
+
+Below are examples of 5 star reviews misclassified by the final model. Note the prevalence of complaints, suggestions, and expressions of other pain points in general, whether they are directed at the restaurant or not:
+
+**The first 2 our hand picked examples from us. The first notably had a stale dish served, but was promptly replaced. The second takes note of the lack of vegetarian and lighter options:**
+
+```{r, error = FALSE, message = FALSE, echo = FALSE}
+x <- 431
+y <- 968
+```
+
+1.  Note the use of "disappointment" and "unusual":
+
+```{r, error = FALSE, message = FALSE, echo = FALSE}
+data_vec$old_text[x] %>% pander()
+```
+
+2.  Note the comments of "vegetarian options" and all menu choices being "heavy":
+
+```{r, error = FALSE, message = FALSE, echo = FALSE}
+data_vec$old_text[y] %>% pander()
+```
+
+**The next 8 are picked based off of the random test sample for this particular render. Not all carry the hallmark of some pain point, however for being entirely 5 star reviews, these features are more prevalent and noticeable:**
+
+1.  
+
+```{r, error = FALSE, warning = FALSE, message = FALSE, echo = FALSE}
+print_review$old_text[1] %>% pander()
+```
+
+2.  
+
+```{r, error = FALSE, warning = FALSE, message = FALSE, echo = FALSE}
+print_review$old_text[2] %>% pander()
+```
+
+3.  
+
+```{r, error = FALSE, warning = FALSE, message = FALSE, echo = FALSE}
+print_review$old_text[3] %>% pander()
+```
+
+4.  
+
+```{r, error = FALSE, warning = FALSE, message = FALSE, echo = FALSE}
+print_review$old_text[4] %>% pander()
+```
+
+5.  
+
+```{r, error = FALSE, warning = FALSE, message = FALSE, echo = FALSE}
+print_review$old_text[5] %>% pander()
+```
+
+6.  
+
+```{r, error = FALSE, warning = FALSE, message = FALSE, echo = FALSE}
+print_review$old_text[6] %>% pander()
+```
+
+7.  
+
+```{r, error = FALSE, warning = FALSE, message = FALSE, echo = FALSE}
+print_review$old_text[7] %>% pander()
+```
+
+8.  
+
+```{r, error = FALSE, warning = FALSE, message = FALSE, echo = FALSE}
+print_review$old_text[8] %>% pander()
+```
+
+## Reference:
+
+Van Gils, W. (n.d.). NLP with R: Part 2 - Training word embedding models and visualize results. Medium. Retrieved from https://medium.com/cmotions/nlp-with-r-part-2-training-word-embedding-models-and-visualize-results-ae444043e234
+
+Cote, P. FIN 450 Class Notes. Retrieved from https://connect.bus.ualberta.ca/connect/#/apps/28/access
+
+How to Change Legend Title in ggplot2 in R. (Year). GeeksforGeeks. Retrieved from https://www.geeksforgeeks.org/how-to-change-legend-title-in-ggplot2-in-r/
+
+How to Display Only Integer Values on an Axis Using ggplot2. (Year). Stack Overflow. Retrieved from https://stackoverflow.com/questions/15622001/how-to-display-only-integer-values-on-an-axis-using-ggplot2
